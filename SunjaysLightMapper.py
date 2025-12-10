@@ -9,10 +9,10 @@ bl_info = {
 }
 
 import bpy
-import random
 import math
+import os
 from bpy.types import Operator, Panel, PropertyGroup
-from bpy.props import IntProperty, PointerProperty
+from bpy.props import IntProperty, PointerProperty, StringProperty
 
 
 # ------------------------------------------------------------------------
@@ -50,16 +50,56 @@ class AtlasLightmapSettings(PropertyGroup):
         min=1,
     )
 
+    output_dir: StringProperty(
+        name="Output Folder",
+        description="Directory where baked lightmaps will be saved (use // for the blend file directory)",
+        subtype='DIR_PATH',
+        default="//",
+    )
+
 
 # ------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------
 
+def is_render_enabled(obj, view_layer):
+    """Return True only if the object is renderable in the active view layer."""
+    try:
+        if obj.hide_render:
+            return False
+    except Exception:
+        pass
+    try:
+        return obj.visible_get(view_layer=view_layer)
+    except Exception:
+        # Fallback: if visibility cannot be queried, assume it is renderable
+        return True
+
+
 def get_bake_objects(context):
-    sel_meshes = [o for o in context.selected_objects if o.type == 'MESH']
+    view_layer = context.view_layer
+    sel_meshes = [o for o in context.selected_objects if o.type == 'MESH' and is_render_enabled(o, view_layer)]
     if sel_meshes:
         return sel_meshes
-    return [o for o in context.scene.objects if o.type == 'MESH']
+    return [o for o in context.scene.objects if o.type == 'MESH' and is_render_enabled(o, view_layer)]
+
+
+def filter_meshes_with_faces(objs, view_layer=None):
+    """Return meshes that have at least one polygon and list the ones skipped."""
+    valid = []
+    skipped = []
+    for obj in objs:
+        if view_layer and not is_render_enabled(obj, view_layer):
+            skipped.append(obj)
+            continue
+        if obj.type != 'MESH' or not obj.data:
+            skipped.append(obj)
+            continue
+        if len(getattr(obj.data, "polygons", [])) == 0:
+            skipped.append(obj)
+            continue
+        valid.append(obj)
+    return valid, skipped
 
 def ensure_lightmap_uv(obj):
     if obj.type != 'MESH' or not obj.data:
@@ -203,6 +243,15 @@ def make_safe_name(raw: str) -> str:
     return "".join(safe)
 
 
+def resolve_output_dir(path_from_settings: str) -> str:
+    resolved = bpy.path.abspath(path_from_settings or "//")
+    try:
+        os.makedirs(resolved, exist_ok=True)
+    except Exception:
+        pass
+    return resolved
+
+
 def group_objects_by_count(objs, group_size: int):
     if group_size <= 0:
         group_size = len(objs)
@@ -213,6 +262,25 @@ def group_objects_by_count(objs, group_size: int):
         if chunk:
             groups.append(chunk)
     return groups
+
+
+def save_lightmap_image(image, scene, output_dir):
+    if image is None:
+        return
+    target_dir = resolve_output_dir(output_dir)
+    filename = f"{make_safe_name(image.name)}.png"
+    filepath = os.path.join(target_dir, filename)
+
+    try:
+        image.filepath_raw = filepath
+        if hasattr(image, "file_format"):
+            image.file_format = 'PNG'
+        image.save_render(filepath, scene=scene)
+    except Exception:
+        try:
+            image.save(filepath)
+        except Exception:
+            pass
 
 # ------------------------------------------------------------------------
 # Bake Operator (now with better noise reduction)
@@ -230,10 +298,19 @@ class LIGHTMAP_OT_bake_atlas(Operator):
         setup_gpu(scene)
         setup_cycles_for_baking(scene, settings.samples)
         setup_bake_settings_for_diffuse_light(scene, settings.margin)
+        output_dir = resolve_output_dir(settings.output_dir)
 
         objs = get_bake_objects(context)
         if not objs:
             self.report({'WARNING'}, "No mesh objects found to bake")
+            return {'CANCELLED'}
+
+        objs, skipped = filter_meshes_with_faces(objs, context.view_layer)
+        if skipped:
+            skipped_names = ", ".join(obj.name for obj in skipped)
+            self.report({'INFO'}, f"Skipped non-mesh/empty objects: {skipped_names}")
+        if not objs:
+            self.report({'WARNING'}, "No mesh objects with faces found to bake")
             return {'CANCELLED'}
 
         # Make sure each bake object has its *own* unique material instances.
@@ -266,6 +343,13 @@ class LIGHTMAP_OT_bake_atlas(Operator):
                 if not group:
                     continue
 
+                group, group_skipped = filter_meshes_with_faces(group, context.view_layer)
+                if group_skipped:
+                    skipped_names = ", ".join(obj.name for obj in group_skipped)
+                    self.report({'INFO'}, f"Skipped non-renderable/empty objects in group {group_index}: {skipped_names}")
+                if not group:
+                    continue
+
                 img_name = f"Lightmap_Group_{group_index:03d}"
                 image = bpy.data.images.get(img_name)
                 if image is None:
@@ -276,204 +360,210 @@ class LIGHTMAP_OT_bake_atlas(Operator):
                         alpha=False,
                         float_buffer=True,  # HDR for better denoising
                     )
-                    image.filepath = f"//{img_name}.png"
+                image.colorspace_settings.name = 'Non-Color'
+                image.filepath = os.path.join(output_dir, f"{img_name}.png")
 
                 ensure_lightmap_nodes_for_group(group, image)
 
                 # --- SAVE ORIGINAL NODE LINKS BEFORE BAKING ---
                 material_state = {}
+                prev_uv_indices = {}
                 materials = set()
                 for obj in group:
                     for slot in obj.material_slots:
                         if slot.material:
                             materials.add(slot.material)
 
-                for mat in materials:
-                    if not mat.use_nodes or not mat.node_tree:
-                        continue
+                try:
+                    for mat in materials:
+                        if not mat.use_nodes or not mat.node_tree:
+                            continue
 
-                    nt = mat.node_tree
-                    principled = find_principled_for_material(mat)
-                    if principled is None:
-                        continue
+                        nt = mat.node_tree
+                        principled = find_principled_for_material(mat)
+                        if principled is None:
+                            continue
 
-                    base_input = principled.inputs.get("Base Color")
-                    if base_input is None:
-                        continue
+                        base_input = principled.inputs.get("Base Color")
+                        if base_input is None:
+                            continue
 
-                    # Save all links
-                    links_data = []
-                    for link in list(base_input.links):
-                        links_data.append((link.from_node.name, link.from_socket.name,
-                                        link.to_node.name, link.to_socket.name))
-                        nt.links.remove(link)  # temporarily disconnect
-                    material_state[mat.name] = links_data
+                        # Save all links
+                        links_data = []
+                        for link in list(base_input.links):
+                            links_data.append((link.from_node.name, link.from_socket.name,
+                                            link.to_node.name, link.to_socket.name))
+                            nt.links.remove(link)  # temporarily disconnect
+                        material_state[mat.name] = links_data
 
-                # --- FORCE LIGHTMAP UV NODE FOR BAKING ---
-                for mat in materials:
-                    nt = mat.node_tree
-                    nodes = nt.nodes
-                    links = nt.links
+                    # --- FORCE LIGHTMAP UV NODE FOR BAKING ---
+                    for mat in materials:
+                        nt = mat.node_tree
+                        nodes = nt.nodes
+                        links = nt.links
 
-                    # Find or create UVMap node for Lightmap
-                    uv_node = None
-                    for n in nodes:
-                        if n.type == "UVMAP" and getattr(n, "uv_map", "") == "Lightmap":
-                            uv_node = n
-                            break
-                    if uv_node is None:
-                        uv_node = nodes.new("ShaderNodeUVMap")
-                        uv_node.uv_map = "Lightmap"
-                        uv_node.name = "LightmapUV"
+                        # Find or create UVMap node for Lightmap
+                        uv_node = None
+                        for n in nodes:
+                            if n.type == "UVMAP" and getattr(n, "uv_map", "") == "Lightmap":
+                                uv_node = n
+                                break
+                        if uv_node is None:
+                            uv_node = nodes.new("ShaderNodeUVMap")
+                            uv_node.uv_map = "Lightmap"
+                            uv_node.name = "LightmapUV"
 
-                    # Connect UVMap to Lightmap image node(s)
-                    for img_node in [n for n in nodes if n.type == "TEX_IMAGE" and n.image == image]:
-                        if not img_node.inputs["Vector"].is_linked:
-                            links.new(uv_node.outputs["UV"], img_node.inputs["Vector"])
+                        # Connect UVMap to Lightmap image node(s)
+                        for img_node in [n for n in nodes if n.type == "TEX_IMAGE" and n.image == image]:
+                            if not img_node.inputs["Vector"].is_linked:
+                                links.new(uv_node.outputs["UV"], img_node.inputs["Vector"])
 
-                prev_uv_indices = {}
-                for obj in group:
-                    if obj.type != 'MESH' or not obj.data:
-                        continue
-                    uv_layers = obj.data.uv_layers
-                    if not uv_layers:
-                        continue
-                    prev_active_idx = uv_layers.active_index
-                    prev_render_idx = getattr(uv_layers, "active_render_index", prev_active_idx)
-                    prev_uv_indices[obj.name] = {
-                        "active_index": prev_active_idx,
-                        "render_index": prev_render_idx,
-                    }
-                    lm_layer = uv_layers.get("Lightmap")
-                    if lm_layer is not None:
-                        lm_index = uv_layers.find(lm_layer.name)
-                        if lm_index != -1:
-                            uv_layers.active_index = lm_index
-                            try:
-                                if hasattr(uv_layers, "active_render_index"):
-                                    uv_layers.active_render_index = lm_index
-                                else:
-                                    for i, layer in enumerate(uv_layers):
-                                        try:
-                                            layer.active_render = (i == lm_index)
-                                        except AttributeError:
-                                            pass
-                            except Exception:
-                                pass
+                    for obj in group:
+                        if obj.type != 'MESH' or not obj.data:
+                            continue
+                        uv_layers = obj.data.uv_layers
+                        if not uv_layers:
+                            continue
+                        prev_active_idx = uv_layers.active_index
+                        prev_render_idx = getattr(uv_layers, "active_render_index", prev_active_idx)
+                        prev_uv_indices[obj.name] = {
+                            "active_index": prev_active_idx,
+                            "render_index": prev_render_idx,
+                        }
+                        lm_layer = uv_layers.get("Lightmap")
+                        if lm_layer is not None:
+                            lm_index = uv_layers.find(lm_layer.name)
+                            if lm_index != -1:
+                                uv_layers.active_index = lm_index
+                                try:
+                                    if hasattr(uv_layers, "active_render_index"):
+                                        uv_layers.active_render_index = lm_index
+                                    else:
+                                        for i, layer in enumerate(uv_layers):
+                                            try:
+                                                layer.active_render = (i == lm_index)
+                                            except AttributeError:
+                                                pass
+                                except Exception:
+                                    pass
 
-                if context.object and context.object.mode != 'OBJECT':
+                    if context.object and context.object.mode != 'OBJECT':
+                        try:
+                            bpy.ops.object.mode_set(mode='OBJECT')
+                        except RuntimeError:
+                            pass
+                    for obj in context.scene.objects:
+                        obj.select_set(False)
+                    for obj in group:
+                        obj.select_set(True)
+                    context.view_layer.objects.active = group[0]
+
+                    bpy.ops.object.mode_set(mode='EDIT')
+                    bpy.ops.mesh.select_all(action='SELECT')
+
+                    if settings.image_size > 0:
+                        margin_uv = float(settings.margin) / float(settings.image_size)
+                    else:
+                        margin_uv = 0.0
+                    margin_uv = min(max(margin_uv, 0.0), 0.02)
+
                     try:
-                        bpy.ops.object.mode_set(mode='OBJECT')
-                    except RuntimeError:
+                        bpy.ops.uv.lightmap_pack(
+                            PREF_CONTEXT='ALL_FACES',
+                            PREF_PACK_IN_ONE=True,
+                            PREF_NEW_UVLAYER=False,
+                            PREF_IMG_PX_SIZE=settings.image_size,
+                            PREF_BOX_DIV=12,
+                            PREF_MARGIN_DIV=0.1,
+                        )
+                    except TypeError:
+                        bpy.ops.uv.smart_project(
+                            angle_limit=math.radians(66.0),
+                            island_margin=margin_uv,
+                        )
+                    try:
+                        bpy.ops.uv.pack_islands(rotate=True, margin=margin_uv)
+                    except Exception:
                         pass
-                for obj in context.scene.objects:
-                    obj.select_set(False)
-                for obj in group:
-                    obj.select_set(True)
-                context.view_layer.objects.active = group[0]
 
-                bpy.ops.object.mode_set(mode='EDIT')
-                bpy.ops.mesh.select_all(action='SELECT')
+                    bpy.ops.object.mode_set(mode='OBJECT')
 
-                if settings.image_size > 0:
-                    margin_uv = float(settings.margin) / float(settings.image_size)
-                else:
-                    margin_uv = 0.0
-                margin_uv = min(max(margin_uv, 0.0), 0.02)
+                    for obj in context.scene.objects:
+                        obj.select_set(False)
+                    for obj in group:
+                        obj.select_set(True)
+                    context.view_layer.objects.active = group[0]
 
-                try:
-                    bpy.ops.uv.lightmap_pack(
-                        PREF_CONTEXT='ALL_FACES',
-                        PREF_PACK_IN_ONE=True,
-                        PREF_NEW_UVLAYER=False,
-                        PREF_IMG_PX_SIZE=settings.image_size,
-                        PREF_BOX_DIV=12,
-                        PREF_MARGIN_DIV=0.1,
-                    )
-                except TypeError:
-                    bpy.ops.uv.smart_project(
-                        angle_limit=math.radians(66.0),
-                        island_margin=margin_uv,
-                    )
-                try:
-                    bpy.ops.uv.pack_islands(rotate=True, margin=margin_uv)
-                except Exception:
-                    pass
-
-                bpy.ops.object.mode_set(mode='OBJECT')
-
-                for obj in context.scene.objects:
-                    obj.select_set(False)
-                for obj in group:
-                    obj.select_set(True)
-                context.view_layer.objects.active = group[0]
-
-                try:
-                    bpy.ops.object.bake(
-                        type='DIFFUSE',
-                        pass_filter={'DIRECT', 'INDIRECT'},
-                        margin=settings.margin,
-                        margin_type='EXTEND',
-                        use_clear=True,
-                        target='IMAGE_TEXTURES',
-                    )
-                except TypeError:
                     try:
                         bpy.ops.object.bake(
                             type='DIFFUSE',
                             pass_filter={'DIRECT', 'INDIRECT'},
                             margin=settings.margin,
+                            margin_type='EXTEND',
                             use_clear=True,
+                            target='IMAGE_TEXTURES',
                         )
                     except TypeError:
-                        bpy.ops.object.bake(
-                            type='DIFFUSE',
-                            margin=settings.margin,
-                            use_clear=True,
-                        )
+                        try:
+                            bpy.ops.object.bake(
+                                type='DIFFUSE',
+                                pass_filter={'DIRECT', 'INDIRECT'},
+                                margin=settings.margin,
+                                use_clear=True,
+                            )
+                        except TypeError:
+                            bpy.ops.object.bake(
+                                type='DIFFUSE',
+                                margin=settings.margin,
+                                use_clear=True,
+                            )
 
-                # --- RESTORE ORIGINAL MATERIAL LINKS ---
-                for mat_name, links_data in material_state.items():
-                    mat = bpy.data.materials.get(mat_name)
-                    if not mat or not mat.node_tree:
-                        continue
+                    save_lightmap_image(image, scene, output_dir)
+                except RuntimeError as exc:
+                    self.report({'ERROR'}, f"Group {group_index} failed: {exc}")
+                finally:
+                    # --- RESTORE ORIGINAL MATERIAL LINKS ---
+                    for mat_name, links_data in material_state.items():
+                        mat = bpy.data.materials.get(mat_name)
+                        if not mat or not mat.node_tree:
+                            continue
 
-                    nt = mat.node_tree
-                    links = nt.links
+                        nt = mat.node_tree
+                        links = nt.links
 
-                    for from_node_name, from_socket_name, to_node_name, to_socket_name in links_data:
-                        from_node = nt.nodes.get(from_node_name)
-                        to_node = nt.nodes.get(to_node_name)
-                        if from_node and to_node:
-                            from_sock = from_node.outputs.get(from_socket_name)
-                            to_sock = to_node.inputs.get(to_socket_name)
-                            if from_sock and to_sock:
-                                links.new(from_sock, to_sock)
+                        for from_node_name, from_socket_name, to_node_name, to_socket_name in links_data:
+                            from_node = nt.nodes.get(from_node_name)
+                            to_node = nt.nodes.get(to_node_name)
+                            if from_node and to_node:
+                                from_sock = from_node.outputs.get(from_socket_name)
+                                to_sock = to_node.inputs.get(to_socket_name)
+                                if from_sock and to_sock:
+                                    links.new(from_sock, to_sock)
 
-                for obj in group:
-                    if obj.type != 'MESH' or not obj.data:
-                        continue
-                    uv_layers = obj.data.uv_layers
-                    if not uv_layers:
-                        continue
-                    prev_info = prev_uv_indices.get(obj.name)
-                    if not prev_info:
-                        continue
-                    prev_active_idx = prev_info["active_index"]
-                    prev_render_idx = prev_info["render_index"]
-                    if 0 <= prev_active_idx < len(uv_layers):
-                        uv_layers.active_index = prev_active_idx
-                    try:
-                        if hasattr(uv_layers, "active_render_index") and 0 <= prev_render_idx < len(uv_layers):
-                            uv_layers.active_render_index = prev_render_idx
-                        else:
-                            for i, layer in enumerate(uv_layers):
-                                try:
-                                    layer.active_render = (i == prev_render_idx)
-                                except AttributeError:
-                                    pass
-                    except Exception:
-                        pass
+                    for obj in group:
+                        if obj.type != 'MESH' or not obj.data:
+                            continue
+                        uv_layers = obj.data.uv_layers
+                        if not uv_layers:
+                            continue
+                        prev_info = prev_uv_indices.get(obj.name)
+                        if not prev_info:
+                            continue
+                        prev_active_idx = prev_info["active_index"]
+                        prev_render_idx = prev_info["render_index"]
+                        if 0 <= prev_active_idx < len(uv_layers):
+                            uv_layers.active_index = prev_active_idx
+                        try:
+                            if hasattr(uv_layers, "active_render_index") and 0 <= prev_render_idx < len(uv_layers):
+                                uv_layers.active_render_index = prev_render_idx
+                            else:
+                                for i, layer in enumerate(uv_layers):
+                                    try:
+                                        layer.active_render = (i == prev_render_idx)
+                                    except AttributeError:
+                                        pass
+                        except Exception:
+                            pass
 
         finally:
             # Restore any stripped normal-map links now that baking is done
@@ -568,6 +658,12 @@ def ensure_lightmap_nodes_for_group(objs, image):
                     except Exception:
                         pass
                     break
+
+        # Always keep the lightmap node active so baking targets it reliably
+        try:
+            nodes.active = lm_node
+        except Exception:
+            pass
 
 
 
@@ -799,6 +895,7 @@ class LIGHTMAP_PT_bake_panel(Panel):
         col.prop(settings, "margin")
         col.prop(settings, "samples")
         col.prop(settings, "group_size")
+        col.prop(settings, "output_dir")
 
         col.separator()
         col.operator("lightmap.bake_atlas", icon='RENDER_STILL')
