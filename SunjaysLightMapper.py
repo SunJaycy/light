@@ -9,10 +9,10 @@ bl_info = {
 }
 
 import bpy
-import random
 import math
+import os
 from bpy.types import Operator, Panel, PropertyGroup
-from bpy.props import IntProperty, PointerProperty
+from bpy.props import IntProperty, PointerProperty, StringProperty
 
 
 # ------------------------------------------------------------------------
@@ -48,6 +48,13 @@ class AtlasLightmapSettings(PropertyGroup):
         description="How many objects to pack into each single lightmap atlas",
         default=5,
         min=1,
+    )
+
+    output_dir: StringProperty(
+        name="Output Folder",
+        description="Directory where baked lightmaps will be saved (use // for the blend file directory)",
+        subtype='DIR_PATH',
+        default="//",
     )
 
 
@@ -203,6 +210,15 @@ def make_safe_name(raw: str) -> str:
     return "".join(safe)
 
 
+def resolve_output_dir(path_from_settings: str) -> str:
+    resolved = bpy.path.abspath(path_from_settings or "//")
+    try:
+        os.makedirs(resolved, exist_ok=True)
+    except Exception:
+        pass
+    return resolved
+
+
 def group_objects_by_count(objs, group_size: int):
     if group_size <= 0:
         group_size = len(objs)
@@ -213,6 +229,25 @@ def group_objects_by_count(objs, group_size: int):
         if chunk:
             groups.append(chunk)
     return groups
+
+
+def save_lightmap_image(image, scene, output_dir):
+    if image is None:
+        return
+    target_dir = resolve_output_dir(output_dir)
+    filename = f"{make_safe_name(image.name)}.png"
+    filepath = os.path.join(target_dir, filename)
+
+    try:
+        image.filepath_raw = filepath
+        if hasattr(image, "file_format"):
+            image.file_format = 'PNG'
+        image.save_render(filepath, scene=scene)
+    except Exception:
+        try:
+            image.save(filepath)
+        except Exception:
+            pass
 
 # ------------------------------------------------------------------------
 # Bake Operator (now with better noise reduction)
@@ -230,6 +265,7 @@ class LIGHTMAP_OT_bake_atlas(Operator):
         setup_gpu(scene)
         setup_cycles_for_baking(scene, settings.samples)
         setup_bake_settings_for_diffuse_light(scene, settings.margin)
+        output_dir = resolve_output_dir(settings.output_dir)
 
         objs = get_bake_objects(context)
         if not objs:
@@ -276,7 +312,8 @@ class LIGHTMAP_OT_bake_atlas(Operator):
                         alpha=False,
                         float_buffer=True,  # HDR for better denoising
                     )
-                    image.filepath = f"//{img_name}.png"
+                image.colorspace_settings.name = 'Non-Color'
+                image.filepath = os.path.join(output_dir, f"{img_name}.png")
 
                 ensure_lightmap_nodes_for_group(group, image)
 
@@ -432,6 +469,8 @@ class LIGHTMAP_OT_bake_atlas(Operator):
                             use_clear=True,
                         )
 
+                save_lightmap_image(image, scene, output_dir)
+
                 # --- RESTORE ORIGINAL MATERIAL LINKS ---
                 for mat_name, links_data in material_state.items():
                     mat = bpy.data.materials.get(mat_name)
@@ -568,6 +607,12 @@ def ensure_lightmap_nodes_for_group(objs, image):
                     except Exception:
                         pass
                     break
+
+        # Always keep the lightmap node active so baking targets it reliably
+        try:
+            nodes.active = lm_node
+        except Exception:
+            pass
 
 
 
@@ -799,6 +844,7 @@ class LIGHTMAP_PT_bake_panel(Panel):
         col.prop(settings, "margin")
         col.prop(settings, "samples")
         col.prop(settings, "group_size")
+        col.prop(settings, "output_dir")
 
         col.separator()
         col.operator("lightmap.bake_atlas", icon='RENDER_STILL')
