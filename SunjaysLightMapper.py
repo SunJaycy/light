@@ -295,6 +295,11 @@ class LIGHTMAP_OT_bake_atlas(Operator):
             self.report({'WARNING'}, "No mesh objects with faces found to bake")
             return {'CANCELLED'}
 
+        objs = get_bake_objects(context)
+        if not objs:
+            self.report({'WARNING'}, "No mesh objects found to bake")
+            return {'CANCELLED'}
+
         # Make sure each bake object has its *own* unique material instances.
         # This avoids one shared material being modified multiple times for
         # different lightmap groups, which used to cause some meshes to appear
