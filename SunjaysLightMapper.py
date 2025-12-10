@@ -68,6 +68,21 @@ def get_bake_objects(context):
         return sel_meshes
     return [o for o in context.scene.objects if o.type == 'MESH']
 
+
+def filter_meshes_with_faces(objs):
+    """Return meshes that have at least one polygon and list the ones skipped."""
+    valid = []
+    skipped = []
+    for obj in objs:
+        if obj.type != 'MESH' or not obj.data:
+            skipped.append(obj)
+            continue
+        if len(getattr(obj.data, "polygons", [])) == 0:
+            skipped.append(obj)
+            continue
+        valid.append(obj)
+    return valid, skipped
+
 def ensure_lightmap_uv(obj):
     if obj.type != 'MESH' or not obj.data:
         return
@@ -266,6 +281,19 @@ class LIGHTMAP_OT_bake_atlas(Operator):
         setup_cycles_for_baking(scene, settings.samples)
         setup_bake_settings_for_diffuse_light(scene, settings.margin)
         output_dir = resolve_output_dir(settings.output_dir)
+
+        objs = get_bake_objects(context)
+        if not objs:
+            self.report({'WARNING'}, "No mesh objects found to bake")
+            return {'CANCELLED'}
+
+        objs, skipped = filter_meshes_with_faces(objs)
+        if skipped:
+            skipped_names = ", ".join(obj.name for obj in skipped)
+            self.report({'INFO'}, f"Skipped non-mesh/empty objects: {skipped_names}")
+        if not objs:
+            self.report({'WARNING'}, "No mesh objects with faces found to bake")
+            return {'CANCELLED'}
 
         objs = get_bake_objects(context)
         if not objs:
